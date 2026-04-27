@@ -1,0 +1,19 @@
+# Shadow Removal Training - Modern MediaPipe (mp.tasks) + Python 3.12
+
+# Core ML
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Face detection (MODERN API - mp.tasks, not mp.solutions)
+mediapipe>=0.10.0
+
+# Image processing & utilities
+numpy>=1.24.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+tqdm>=4.66.0
+PyYAML>=6.0
+
+# Optional for training visualization
+tensorboard>=2.14.0
+scikit-image>=0.21.0
