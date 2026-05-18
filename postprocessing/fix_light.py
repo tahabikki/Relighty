@@ -349,66 +349,11 @@ def fix_light(image):
     alpha_face = (cv2.GaussianBlur(face_mask_hr, (15, 15), 0) * dynamic_strength)[..., None]
     blended    = image_f * (1.0 - alpha_face) + pred_textured * alpha_face
 
-    # 9. Correction cou — colonne par colonne
-    # Un seul scalaire moyen ne fonctionne pas sur les visages éclairés de façon
-    # directionnelle : le côté clair annule le côté sombre → delta ≈ 0.
-    # Solution : pour chaque colonne x, mesurer la correction L au bas du visage
-    # (menton) et l'extrapoler à la colonne correspondante du cou.
-    # Cela suit naturellement la direction de l'ombre.
-    orig_lab_lr = cv2.cvtColor(resized, cv2.COLOR_BGR2LAB).astype(np.float32)
-    pred_lab_lr = cv2.cvtColor(pred_bgr_lr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    l_delta_lr  = pred_lab_lr[:, :, 0] - orig_lab_lr[:, :, 0]  # (H, W)
-
-    face_hard = (face_mask_lr > 0.5).astype(np.uint8)
-    coords_h  = cv2.findNonZero(face_hard)
-
-    if coords_h is not None:
-        bx_h, by_h, bw_h, bh_h = cv2.boundingRect(coords_h)
-
-        # Strip menton = bas 20 % de la bbox visage
-        chin_top = by_h + int(bh_h * 0.80)
-        chin_bot = by_h + bh_h
-        chin_strip = np.zeros(face_mask_lr.shape, dtype=np.float32)
-        chin_strip[chin_top:chin_bot, bx_h:bx_h + bw_h] = 1.0
-        chin_strip *= (face_mask_lr > 0.4).astype(np.float32)
-
-        # Moyenne L-delta par colonne (vectorisée, pas de boucle Python)
-        col_sum   = (l_delta_lr * chin_strip).sum(axis=0)       # (W,)
-        col_count = chin_strip.sum(axis=0)                       # (W,)
-        l_corr_col = np.where(col_count > 0,
-                              col_sum / (col_count + 1e-6),
-                              0.0).astype(np.float32)            # (W,)
-
-        # Lissage horizontal pour éviter les artéfacts entre colonnes
-        l_corr_col = cv2.GaussianBlur(
-            l_corr_col.reshape(1, -1), (31, 1), 0
-        ).reshape(-1)
-
-        # Carte 2D : chaque ligne du cou hérite de la correction de sa colonne
-        l_corr_map_lr = np.tile(l_corr_col, (SHADOW_INPUT_SIZE, 1))  # (H, W)
-
-        # Upscale à la résolution originale
-        l_corr_map_hr = cv2.resize(
-            l_corr_map_lr, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR
-        )
-
-        # N'appliquer que si la correction est significative (évite les photos déjà bien éclairées)
-        max_corr = float(np.abs(l_corr_col[bx_h:bx_h + bw_h]).max()) if bw_h > 0 else 0.0
-        if max_corr > 0.5:
-            orig_lab_hr = cv2.cvtColor(
-                np.clip(image_f, 0, 255).astype(np.uint8), cv2.COLOR_BGR2LAB
-            ).astype(np.float32)
-
-            neck_corrected_lab          = orig_lab_hr.copy()
-            neck_corrected_lab[:, :, 0] = np.clip(
-                orig_lab_hr[:, :, 0] + l_corr_map_hr, 0, 255
-            )
-            neck_corrected_bgr = cv2.cvtColor(
-                neck_corrected_lab.astype(np.uint8), cv2.COLOR_LAB2BGR
-            ).astype(np.float32)
-
-            alpha_neck = (neck_mask_hr * dynamic_strength)[..., None]
-            blended    = blended * (1.0 - alpha_neck) + neck_corrected_bgr * alpha_neck
+    # 9. Fusion cou — apply same model prediction as face
+    # Check if neck mask has significant coverage
+    if neck_mask_hr.sum() > 100:
+        alpha_neck = (cv2.GaussianBlur(neck_mask_hr, (15, 15), 0) * dynamic_strength)[..., None]
+        blended    = blended * (1.0 - alpha_neck) + pred_textured * alpha_neck
 
     return np.clip(blended, 0, 255).astype(np.uint8)
 

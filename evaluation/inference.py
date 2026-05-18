@@ -67,6 +67,24 @@ def find_checkpoint() -> Optional[Path]:
 
 # ─── Core inference ───────────────────────────────────────────────────────────
 
+def _extend_mask_with_neck(mask: np.ndarray, face_bottom_y: float) -> np.ndarray:
+    """Extend face mask downward to include neck region."""
+    h, w = mask.shape
+    extended = mask.copy()
+    
+    chin_y = int(face_bottom_y)
+    neck_top = chin_y
+    neck_bottom = min(h, int(chin_y + (h - chin_y) * 0.6))
+    
+    if neck_top < h and neck_bottom > neck_top:
+        for y in range(neck_top, neck_bottom):
+            fade = (y - neck_top) / (neck_bottom - neck_top)
+            fade = max(0, 1 - fade * 1.5)
+            extended[y, :] = np.maximum(extended[y, :], fade)
+    
+    return extended
+
+
 @torch.no_grad()
 def remove_shadow(
     model:      ShadowRemovalNet,
@@ -88,8 +106,13 @@ def remove_shadow(
 
     # Face mask  (H × W float32 [0, 1])
     rgb  = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-    mask = mask_gen(rgb)            # H × W
+    mask, pts = mask_gen.detect(rgb)  # Get both mask and landmarks
 
+    # Get face bottom (chin) for neck extension
+    face_bottom = None
+    if pts is not None:
+        face_bottom = pts[:, 1].max()  # Bottom-most landmark = chin
+    
     # Run model
     tensor = (
         torch.from_numpy(rgb.astype(np.float32) / 255.0)
@@ -113,15 +136,14 @@ def remove_shadow(
     orig_lab = cv2.cvtColor(resized, cv2.COLOR_BGR2LAB).astype(np.float32)
     pred_lab = cv2.cvtColor(pred_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
     
-    # Use model's L (luminance) channel ONLY, keep original colors (A, B)
-    # This extracts ONLY the shadow removal, not color changes
-    # Then blend conservatively using the mask
-    mask_3ch = mask[:, :, None]
+    # Extend mask to include neck
+    if face_bottom is not None:
+        mask = _extend_mask_with_neck(mask, face_bottom)
     
     # Extract luminance improvement from model
     l_diff = pred_lab[:, :, 0] - orig_lab[:, :, 0]
     
-    # Apply luminance diff only in high-mask areas, very conservatively
+    # Apply luminance diff in face+neck region, very conservatively
     l_diff = l_diff * (mask * 0.5)  # Max contribution = 0.5 * luminance difference
     
     # Blend: mix original L with improved L based on mask
