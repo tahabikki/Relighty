@@ -1,48 +1,50 @@
 model:
-  name: resunet++                 # Choose: 'unet' (29M params) or 'resunet++' (50M params, 2x better quality)
-  input_size: 256
+  name: unet_resnet34
+  input_size: 512
   channels: 3
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TRAINING
-# ─────────────────────────────────────────────────────────────────────────────
 training:
-  batch_size: 8
-  epochs: 150
-  learning_rate: 0.0001           # decoder / bottleneck LR
-  encoder_lr_factor: 0.1          # encoder trains at LR × this value (fine-tune slowly)
-  mixed_precision: true           # AMP — ~2× faster on GPU, uses less VRAM
-  gradient_clip: 1.0              # max gradient norm
-  cudnn_benchmark: true           # faster for fixed input size
-  scheduler_patience: 10          # ReduceLROnPlateau: epochs before LR drop (was 5 — too aggressive)
-  scheduler_factor: 0.5           # LR multiplied by this when plateau detected
-  scheduler_min_lr: 1.0e-6        # never drop LR below this — prevents model from freezing
+  batch_size: 4
+  epochs: 200
+  lr: 0.00001
+  enc_lr: 0.000001
+  no_amp: true
+  optimizer: AdamW
+  weight_decay: 0.0001
+  save_every: 10
+  device: auto          # auto | cuda | cpu | mps
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LOSS
-# Only l1_weight and perceptual_weight are active.
-# The rest are accepted by ShadowRemovalLoss but silently ignored.
-# ─────────────────────────────────────────────────────────────────────────────
+early_stopping:
+  enabled: true
+  patience: 15          # stop if val loss doesn't improve for N epochs
+  min_delta: 0.0001     # min change to qualify as improvement
+
+logging:
+  log_dir: logs         # relative to project root
+  save_frequency: 1     # save logs every N batches
+
+dataloader:
+  num_workers: 0        # set 0 on Windows if you have issues
+  pin_memory: true
+  persistent_workers: true
+
 loss:
-  l1_weight: 1.0                  # L1 on face region (mask-weighted) — pixel accuracy
-  perceptual_weight: 0.1          # VGG16 relu2_2 + relu3_3 on full image — texture sharpness
-  ssim_weight: 0.0                # disabled
-  identity_weight: 0.0            # disabled
-  color_weight: 0.0               # disabled
+  l1_weight: 1.0
+  ssim_weight: 0.5
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DATA
-# ─────────────────────────────────────────────────────────────────────────────
 data:
-  split_dir: split/splited_dataset_data
-  output_size: 256
-  num_workers: 0      # 0 = main thread only — avoids Windows paging file exhaustion from spawning CUDA worker processes
-  pin_memory: false       # pin_memory requires worker threads; must be false when num_workers=0
-  persistent_workers: false  # no workers to persist
+  dataset_dir: dataset
+  input_subdir: input
+  target_subdir: target
+  splits_dir: dataset/splits
+  image_size: 512
+  train_ratio: 0.85
+  seed: 42
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CHECKPOINTS
-# ─────────────────────────────────────────────────────────────────────────────
 checkpoint:
   dir: checkpoints
-  save_every: 5                   # also save every N epochs (always saves latest + best)
+  save_every: 10
+
+inference:
+  output_dir: Results/output
+  input_dir: Results/input

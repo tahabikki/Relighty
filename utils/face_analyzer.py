@@ -232,3 +232,153 @@ class FaceAnalyzer:
         analysis_map = np.stack([shadow_map, light_map, confidence_map], axis=2)
 
         return analysis_map.astype(np.float32)
+
+    def compute_cheek_shadow_mask(self, image):
+        """
+        Specifically detect shadows in cheek regions.
+        Cheeks are the MOST CRITICAL area for shadow removal (ICAO requirement).
+        Returns mask where cheeks have high values if shadowed.
+        """
+        h, w = image.shape[:2]
+        landmarks = self.detect_landmarks(image)
+
+        if landmarks is None:
+            return np.zeros((h, w), dtype=np.float32)
+
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        cheek_mask = np.zeros((h, w), dtype=np.float32)
+
+        # Process both cheeks
+        for indices in [self.LEFT_CHEEK, self.RIGHT_CHEEK]:
+            region_points = landmarks[indices].astype(np.int32)
+            region_points = np.clip(region_points, 0, [w-1, h-1])
+
+            # Create mask for this cheek
+            cheek_region = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillPoly(cheek_region, [region_points], 1)
+
+            # Compute brightness in cheek region
+            cheek_brightness = gray[cheek_region > 0]
+            if len(cheek_brightness) > 0:
+                cheek_avg = cheek_brightness.mean()
+                # Shadow intensity = 1 - brightness (dark = high shadow)
+                shadow_intensity = 1.0 - cheek_avg
+                cheek_mask[cheek_region > 0] = shadow_intensity
+
+        # Smooth transitions
+        cheek_mask = cv2.GaussianBlur(cheek_mask, (11, 11), 0)
+        cheek_mask = np.clip(cheek_mask, 0, 1)
+
+        return cheek_mask
+
+    def compute_forehead_shadow_mask(self, image):
+        """
+        Specifically detect shadows in forehead region.
+        Forehead also important for ICAO compliance (light, clear).
+        """
+        h, w = image.shape[:2]
+        landmarks = self.detect_landmarks(image)
+
+        if landmarks is None:
+            return np.zeros((h, w), dtype=np.float32)
+
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        forehead_mask = np.zeros((h, w), dtype=np.float32)
+
+        region_points = landmarks[self.FOREHEAD].astype(np.int32)
+        region_points = np.clip(region_points, 0, [w-1, h-1])
+
+        # Create mask for forehead
+        forehead_region = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(forehead_region, [region_points], 1)
+
+        # Compute brightness in forehead region
+        forehead_brightness = gray[forehead_region > 0]
+        if len(forehead_brightness) > 0:
+            forehead_avg = forehead_brightness.mean()
+            shadow_intensity = 1.0 - forehead_avg
+            forehead_mask[forehead_region > 0] = shadow_intensity
+
+        # Smooth transitions
+        forehead_mask = cv2.GaussianBlur(forehead_mask, (11, 11), 0)
+        forehead_mask = np.clip(forehead_mask, 0, 1)
+
+        return forehead_mask
+
+    def compute_under_eye_shadow_mask(self, image):
+        """
+        Specifically detect shadows under eyes.
+        Under-eye shadows are very common and need careful removal.
+        """
+        h, w = image.shape[:2]
+        landmarks = self.detect_landmarks(image)
+
+        if landmarks is None:
+            return np.zeros((h, w), dtype=np.float32)
+
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        eye_mask = np.zeros((h, w), dtype=np.float32)
+
+        # Extend under-eye regions downward
+        for eye_indices in [self.LEFT_EYE, self.RIGHT_EYE]:
+            eye_points = landmarks[eye_indices].astype(np.int32)
+            eye_points = np.clip(eye_points, 0, [w-1, h-1])
+
+            # Create under-eye region by extending downward
+            under_eye_points = eye_points.copy()
+            under_eye_points[:, 1] += int((eye_points[:, 1].max() - eye_points[:, 1].min()) * 0.3)
+
+            under_eye_region = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillPoly(under_eye_region, [under_eye_points], 1)
+
+            # Compute brightness under eyes
+            eye_brightness = gray[under_eye_region > 0]
+            if len(eye_brightness) > 0:
+                eye_avg = eye_brightness.mean()
+                shadow_intensity = 1.0 - eye_avg
+                eye_mask[under_eye_region > 0] = shadow_intensity
+
+        # Smooth transitions (subtle blending for under-eyes)
+        eye_mask = cv2.GaussianBlur(eye_mask, (9, 9), 0)
+        eye_mask = np.clip(eye_mask, 0, 1)
+
+        return eye_mask
+
+    def compute_region_weights(self, image):
+        """
+        Compute per-region importance weights for training.
+        
+        Returns 3-channel map:
+        - Channel 0: Face region weight (1.0 on face, 0 elsewhere)
+        - Channel 1: Shadow region weight (high where shadows detected)
+        - Channel 2: Critical region weight (cheeks/forehead > under-eyes > rest)
+        """
+        h, w = image.shape[:2]
+        
+        # Base face confidence
+        face_weight = self.compute_face_confidence_map(image)
+        
+        # Shadow importance weights
+        cheek_shadow = self.compute_cheek_shadow_mask(image)
+        forehead_shadow = self.compute_forehead_shadow_mask(image)
+        eye_shadow = self.compute_under_eye_shadow_mask(image)
+        
+        # Combine shadows (cheeks most important, then forehead, then eyes)
+        shadow_weight = (
+            0.5 * cheek_shadow +      # 50% weight to cheeks
+            0.3 * forehead_shadow +   # 30% weight to forehead
+            0.2 * eye_shadow          # 20% weight to under-eyes
+        )
+        shadow_weight = np.clip(shadow_weight, 0, 1)
+        
+        # Critical regions (where we focus most training loss)
+        critical_weight = (
+            0.6 * cheek_shadow +
+            0.4 * forehead_shadow
+        )
+        critical_weight = np.clip(critical_weight, 0, 1)
+        
+        # Combine into 3-channel map
+        region_weights = np.stack([face_weight, shadow_weight, critical_weight], axis=2)
+        
+        return region_weights.astype(np.float32)

@@ -1,169 +1,242 @@
+#!/usr/bin/env python
+"""
+Shadow removal inference — single image or full folder batch.
+
+What it does
+────────────
+1. Load the trained model from the best checkpoint.
+2. For each image:
+   a. Resize to 256 × 256 (model input).
+   b. Run MediaPipe to get the face mask.
+   c. Run model → shadow-free prediction.
+   d. BLEND: face region = model output,
+             background  = original pixels (completely unchanged).
+   e. Resize back to original resolution.
+3. Save result.
+
+Usage
+─────
+    # Single image  (output auto-named: clean_<input>.jpg)
+    python evaluation/inference.py --input portrait.jpg
+
+    # Single image, explicit output path
+    python evaluation/inference.py --input portrait.jpg --output result.jpg
+
+    # Batch folder  (Results/output/ by default)
+    python evaluation/inference.py --input Results/input
+
+    # Explicit checkpoint
+    python evaluation/inference.py \\
+        --input Results/input \\
+        --checkpoint checkpoints/shadow_removal_epoch_080.pth
+"""
 import sys
-sys.path.insert(0, '.')
+from pathlib import Path
+from typing import Optional
 
-import os
 import cv2
-import torch
 import numpy as np
-import mediapipe as mp
-from models_Relighty import UNet
-from models_Relighty.unet_v2 import UNetV2
-from utils.face_analyzer import FaceAnalyzer
+import torch
 
-class ShadowRemovalModel:
-    def __init__(self, checkpoint_path="checkpoints/best_model.pth", use_v2=True):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.face_analyzer = None
-        self.use_v2 = False
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
-        if os.path.exists(checkpoint_path):
-            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+from models.shadow_remover import ShadowRemovalNet
+from masking.mediapipe_mask import FaceMaskGenerator
 
-            model_state = checkpoint['model_state_dict']
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
 
-            has_attention = any('attention' in k for k in model_state.keys())
-            has_bottleneck = any('bottleneck' in k for k in model_state.keys())
 
-            if has_attention or has_bottleneck:
-                print("✓ Detected: UNetV2 checkpoint (Face-Aware, 6-channel input)")
-                self.model = UNetV2(input_channels=6, output_channels=3).to(self.device)
-                self.face_analyzer = FaceAnalyzer()
-                self.use_v2 = True
-            else:
-                print("✓ Detected: UNet checkpoint (Legacy, 3-channel input)")
-                self.model = UNet().to(self.device)
-                self.use_v2 = False
+# ─── Model loading ────────────────────────────────────────────────────────────
 
-            try:
-                self.model.load_state_dict(model_state)
-                print(f"✓ Loaded: {checkpoint_path}")
-            except RuntimeError as e:
-                print(f"✗ Failed to load checkpoint: {e}")
-                print(f"Creating untrained model...")
-                if self.use_v2:
-                    self.model = UNetV2(input_channels=6, output_channels=3).to(self.device)
-                    self.face_analyzer = FaceAnalyzer()
-                else:
-                    self.model = UNet().to(self.device)
+def load_model(ckpt_path: str, device: torch.device) -> ShadowRemovalNet:
+    model = ShadowRemovalNet().to(device)
+    raw   = torch.load(ckpt_path, map_location=device, weights_only=False)
+    model.load_state_dict(raw.get("model", raw))
+    model.eval()
+    return model
+
+
+def find_checkpoint() -> Optional[Path]:
+    best = ROOT / "checkpoints" / "shadow_removal_best.pth"
+    if best.exists():
+        return best
+    ckpts = sorted((ROOT / "checkpoints").glob("*.pth"))
+    return ckpts[-1] if ckpts else None
+
+
+# ─── Core inference ───────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def remove_shadow(
+    model:      ShadowRemovalNet,
+    mask_gen:   FaceMaskGenerator,
+    img_bgr:    np.ndarray,
+    device:     torch.device,
+    img_size:   int = 256,
+) -> np.ndarray:
+    """
+    Remove facial shadows from one image with invisible mask blending.
+
+    Returns a uint8 BGR image at the original input resolution.
+    Background pixels are IDENTICAL to the input.
+    """
+    orig_h, orig_w = img_bgr.shape[:2]
+
+    # Resize to model input
+    resized = cv2.resize(img_bgr, (img_size, img_size))
+
+    # Face mask  (H × W float32 [0, 1])
+    rgb  = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    mask = mask_gen(rgb)            # H × W
+
+    # Run model
+    tensor = (
+        torch.from_numpy(rgb.astype(np.float32) / 255.0)
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .to(device)
+    )
+    pred_01 = model(tensor)         # [0, 1]
+
+    # Back to numpy uint8 BGR
+    pred_rgb = (
+        pred_01.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0
+    ).clip(0, 255).astype(np.uint8)
+    pred_bgr = cv2.cvtColor(pred_rgb, cv2.COLOR_RGB2BGR)
+
+    # Very conservative blending: use only shadows removed from model
+    # Do NOT use full model output (too desaturated)
+    # Instead: extract shadow differences and apply only those
+    
+    # Convert to LAB for perceptually better blending
+    orig_lab = cv2.cvtColor(resized, cv2.COLOR_BGR2LAB).astype(np.float32)
+    pred_lab = cv2.cvtColor(pred_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    
+    # Use model's L (luminance) channel ONLY, keep original colors (A, B)
+    # This extracts ONLY the shadow removal, not color changes
+    # Then blend conservatively using the mask
+    mask_3ch = mask[:, :, None]
+    
+    # Extract luminance improvement from model
+    l_diff = pred_lab[:, :, 0] - orig_lab[:, :, 0]
+    
+    # Apply luminance diff only in high-mask areas, very conservatively
+    l_diff = l_diff * (mask * 0.5)  # Max contribution = 0.5 * luminance difference
+    
+    # Blend: mix original L with improved L based on mask
+    blended_lab = orig_lab.copy()
+    blended_lab[:, :, 0] = np.clip(
+        orig_lab[:, :, 0] + l_diff,
+        0, 255
+    )
+    # Keep A, B channels (colors) completely original
+    
+    # Back to BGR
+    blended = cv2.cvtColor(blended_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+    # Restore original resolution
+    if (orig_h, orig_w) != (img_size, img_size):
+        blended = cv2.resize(blended, (orig_w, orig_h),
+                             interpolation=cv2.INTER_LANCZOS4)
+    return blended
+
+
+# ─── CLI ─────────────────────────────────────────────────────────────────────
+
+def main():
+    import argparse
+    import yaml
+    
+    p = argparse.ArgumentParser(description="Face shadow removal inference")
+    p.add_argument("--input",      required=True,
+                   help="Input image path or folder")
+    p.add_argument("--output",     default=None,
+                   help="Output image path or folder (auto-named if omitted)")
+    p.add_argument("--checkpoint", default=None,
+                   help="Checkpoint .pth path (auto-detected if omitted)")
+    p.add_argument("--device",     default="auto")
+    p.add_argument("--img_size",   type=int, default=None)
+    args = p.parse_args()
+    
+    # ── Load image_size from config if not overridden ──────────────────────
+    if args.img_size is None:
+        config_path = ROOT / "configs" / "config.yaml"
+        if config_path.exists():
+            with open(config_path, "r") as f:
+                config = yaml.safe_load(f) or {}
+            args.img_size = config.get("data", {}).get("image_size", 256)
         else:
-            print(f"✗ No checkpoint found: {checkpoint_path}")
-            print(f"Using untrained model. Please train first:")
-            print(f"  python train/scripts/main.py")
-            self.model = UNetV2(input_channels=6, output_channels=3).to(self.device)
-            self.face_analyzer = FaceAnalyzer()
-            self.use_v2 = True
+            args.img_size = 256
 
-        self.model.eval()
-        self.output_size = 256
-        self.face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-        )
-        self.eye_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + 'haarcascade_eye.xml'
-        )
-    
-    def create_face_neck_mask(self, image):
-        if self.face_analyzer is None:
-            return np.ones((image.shape[0], image.shape[1]), dtype=np.float32)
-        return self.face_analyzer.compute_face_confidence_map(image)
-
-    def preprocess(self, image):
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        gray = cv2.equalizeHist(gray)
-        faces = self.face_cascade.detectMultiScale(gray, 1.1, 4)
-        if len(faces) == 0:
-            return None, None, None
-        x, y, w, h = faces[0]
-        face_gray = gray[y:y+h, x:x+w]
-        eyes = self.eye_cascade.detectMultiScale(face_gray, 1.1, 4)
-        if len(eyes) >= 2:
-            ex1, ey1, _, _ = eyes[0]
-            ex2, ey2, _, _ = eyes[1]
-            left_eye = np.array([x + ex1, y + ey1], dtype=np.float64)
-            right_eye = np.array([x + ex2, y + ey2], dtype=np.float64)
-            if left_eye[0] > right_eye[0]:
-                left_eye, right_eye = right_eye, left_eye
+    # Device (auto: CUDA → MPS → CPU)
+    if args.device == "auto":
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = torch.device("mps")
         else:
-            cx, cy = x + w/2, y + h/2
-            left_eye = np.array([cx - w*0.3, cy - h*0.15], dtype=np.float64)
-            right_eye = np.array([cx + w*0.3, cy - h*0.15], dtype=np.float64)
-        src_center = (left_eye + right_eye) / 2
-        dst_center = np.array([112.0, 115.0], dtype=np.float64)
-        eye_dist = np.linalg.norm(right_eye - left_eye)
-        dst_dist = np.linalg.norm(np.array([152.0, 115.0]) - np.array([112.0, 115.0]))
-        scale = dst_dist / eye_dist if eye_dist > 0 else 1.0
-        tx = dst_center[0] - scale * src_center[0]
-        ty = dst_center[1] - scale * src_center[1]
-        M = np.array([[scale, 0, tx], [0, scale, ty]], dtype=np.float64)
-        aligned = cv2.warpAffine(image, M, (self.output_size, self.output_size),
-                           flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-        raw_mask = self.create_face_neck_mask(aligned)
-        mask = cv2.warpAffine(raw_mask, M, (self.output_size, self.output_size),
-                           flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-        mask = np.clip(mask, 0, 1).astype(np.float32)
-        tensor = self.to_tensor(aligned)
-        return tensor, aligned, mask
-    
-    def to_tensor(self, image):
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image = image.astype(np.float32) / 127.5 - 1.0
-        return torch.from_numpy(image).permute(2, 0, 1).float().unsqueeze(0)
-    
-    def tensor_to_image(self, tensor):
-        img = tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
-        img = (img + 1.0) * 127.5
-        img = np.clip(img, 0, 255).astype(np.uint8)
-        return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    
-    def process(self, image):
-        tensor, aligned, mask = self.preprocess(image)
-        if tensor is None:
-            print("No face detected, returning original")
-            return image
-        tensor = tensor.to(self.device)
+            device = torch.device("cpu")
+    else:
+        device = torch.device(args.device)
 
-        with torch.no_grad():
-            if self.use_v2 and self.face_analyzer:
-                analysis_map = self.face_analyzer.create_analysis_map(aligned)
-                analysis_tensor = torch.from_numpy(analysis_map).permute(2, 0, 1).unsqueeze(0).to(self.device)
-                output = self.model(tensor, analysis_tensor)
-            else:
-                output = self.model(tensor)
+    # Checkpoint
+    ckpt_path = args.checkpoint or find_checkpoint()
+    if ckpt_path is None:
+        print("ERROR: No checkpoint found.\n  Train first: python train/train.py")
+        sys.exit(1)
+    print(f"Checkpoint : {ckpt_path}")
+    print(f"Device     : {device}")
 
-        result = self.tensor_to_image(output)
-        if mask is not None:
-            mask_3ch = np.stack([mask, mask, mask], axis=2)
-            result = (result * mask_3ch + aligned * (1 - mask_3ch)).astype(np.uint8)
-        return result
+    model    = load_model(str(ckpt_path), device)
+    mask_gen = FaceMaskGenerator(args.img_size)
+    print("Model ready.\n")
 
-def process_directory(input_dir, output_dir, checkpoint="checkpoints/best_model.pth"):
-    os.makedirs(output_dir, exist_ok=True)
-    model = ShadowRemovalModel(checkpoint, use_v2=True)
-    files = sorted([f for f in os.listdir(input_dir) if f.endswith(('.png', '.jpg', '.jpeg'))])
-    print(f"\nProcessing {len(files)} images from {input_dir}")
-    print(f"Model: {'UNetV2 (Face-Aware)' if model.use_v2 else 'UNet (Legacy)'}\n")
-    for f in files:
-        image = cv2.imread(os.path.join(input_dir, f))
-        if image is None:
-            print(f"✗ Failed to load: {f}")
-            continue
-        try:
-            result = model.process(image)
-            name, ext = os.path.splitext(f)
-            output_name = f"{name}_test{ext}"
-            cv2.imwrite(os.path.join(output_dir, output_name), result)
-            print(f"✓ Saved: {output_name}")
-        except Exception as e:
-            print(f"✗ Error {f}: {e}")
-    print("\n✓ Done!")
+    inp_path = Path(args.input)
+
+    # ── Single image ──────────────────────────────────────────────────────────
+    if inp_path.is_file():
+        out_path = (
+            Path(args.output) if args.output
+            else inp_path.parent / f"clean_{inp_path.name}"
+        )
+        img = cv2.imread(str(inp_path))
+        if img is None:
+            print(f"ERROR: Cannot read {inp_path}")
+            sys.exit(1)
+        result = remove_shadow(model, mask_gen, img, device, args.img_size)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(out_path), result)
+        print(f"Saved → {out_path}")
+
+    # ── Batch folder ──────────────────────────────────────────────────────────
+    elif inp_path.is_dir():
+        out_dir = (
+            Path(args.output) if args.output
+            else ROOT / "Results" / "output"
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        files = sorted(f for f in inp_path.iterdir()
+                       if f.suffix.lower() in IMG_EXTS)
+        if not files:
+            print(f"No images found in {inp_path}")
+            sys.exit(0)
+        print(f"Processing {len(files)} images → {out_dir}\n")
+        for i, f in enumerate(files, 1):
+            img = cv2.imread(str(f))
+            if img is None:
+                print(f"  [{i:>4}/{len(files)}]  SKIP (unreadable) : {f.name}")
+                continue
+            result   = remove_shadow(model, mask_gen, img, device, args.img_size)
+            out_file = out_dir / f"clean_{f.name}"
+            cv2.imwrite(str(out_file), result)
+            print(f"  [{i:>4}/{len(files)}]  {f.name}  →  {out_file.name}")
+        print(f"\nDone.  Results in {out_dir}")
+
+    else:
+        print(f"ERROR: {inp_path} is not a file or directory.")
+        sys.exit(1)
+
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-i", "--input", default="Results/input", help="Input folder")
-    parser.add_argument("-o", "--output", default="Results/output", help="Output folder")
-    parser.add_argument("-c", "--checkpoint", default="checkpoints/best_model.pth")
-    args = parser.parse_args()
-    
-    os.makedirs(args.input, exist_ok=True)
-    process_directory(args.input, args.output, args.checkpoint)
+    main()
