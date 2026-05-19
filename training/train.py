@@ -3,59 +3,57 @@
 Train the face shadow removal model.
 
 Quick start
-───────────
+──────────
     # Step 1 – create train/val split (only once)
-    python utils/split.py
+    python -m utils.split
 
     # Step 2 – train
-    python train/train.py
+    python -m training.train
 
     # Step 3 – resume after interruption
-    python train/train.py --resume
+    python -m training.train --resume
 
 Common overrides
 ────────────────
-    python train/train.py --epochs 150 --batch 16
-    python train/train.py --batch 4 --workers 0   # low-memory GPU / Windows
-    python train/train.py --device cpu             # CPU-only
-    python train/train.py --device mps             # Apple Silicon
+    python -m training.train --epochs 150 --batch 16
+    python -m training.train --batch 4 --workers 0   # low-memory GPU / Windows
+    python -m training.train --device cpu             # CPU-only
+    python -m training.train --device mps             # Apple Silicon
+
+All paths are configured in configs/config.yaml - edit it to deploy anywhere.
 """
-# ── Suppress MediaPipe / TF-Lite / GLOG noise BEFORE any import ──────────────
 import os
-os.environ.setdefault("GLOG_minloglevel",      "3")   # suppress MediaPipe C++ logs
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL",  "3")   # suppress TF-Lite logs
-os.environ.setdefault("MEDIAPIPE_DISABLE_GPU", "1")   # keep MP on CPU (model runs on CUDA)
+import sys
+from pathlib import Path
+
+os.environ.setdefault("GLOG_minloglevel",      "3")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL",  "3")
+os.environ.setdefault("MEDIAPIPE_DISABLE_GPU", "1")
 
 import argparse
-import sys
 import platform
 import time
 import warnings
 import csv
-import yaml
 warnings.filterwarnings("ignore")
-
-from pathlib import Path
 
 import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
-# ── project root on path ──────────────────────────────────────────────────────
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
+from utils.config_loader import get_config, get_split_path, get_checkpoint_path, get_log_path
 from models.shadow_remover import ShadowRemovalNet
 from training.dataset import ShadowDataset
 from training.losses import CombinedLoss
 
-SPLIT_DIR = ROOT / "dataset" / "splits"
-CKPT_DIR  = ROOT / "checkpoints"
+config = get_config()
 
 W = 60  # console width
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser(description="Shadow removal training")
     p.add_argument("--epochs",     type=int,   default=100)
@@ -78,18 +76,17 @@ def parse_args():
     return p.parse_args()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 def _check_split_files():
     required = [
-        SPLIT_DIR / "train_input.txt",
-        SPLIT_DIR / "train_target.txt",
-        SPLIT_DIR / "val_input.txt",
-        SPLIT_DIR / "val_target.txt",
+        get_split_path("train_input.txt"),
+        get_split_path("train_target.txt"),
+        get_split_path("val_input.txt"),
+        get_split_path("val_target.txt"),
     ]
     missing = [f for f in required if not f.exists()]
     if missing:
         print("  ERROR: Split files not found. Run first:")
-        print("    python utils/split.py")
+        print("    python -m utils.split")
         sys.exit(1)
 
 
@@ -98,46 +95,33 @@ def _bar(label: str, char: str = "─") -> str:
     return f"  {label} {char * pad}"
 
 
-def _load_config():
-    """Load config from YAML file."""
-    config_path = ROOT / "configs" / "config.yaml"
-    if not config_path.exists():
-        return {}
-    with open(config_path, "r") as f:
-        return yaml.safe_load(f) or {}
-
-
 def _setup_logging(log_dir: Path):
     """Create logs directory and return path to CSV log file."""
     log_dir.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     log_file = log_dir / f"train_{timestamp}.csv"
-    
-    # Write CSV header
+
     with open(log_file, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "epoch", "train_loss", "val_loss", "best_loss", 
+            "epoch", "train_loss", "val_loss", "best_loss",
             "lr", "grad_norm", "time_sec", "is_best"
         ])
-    
+
     return log_file
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 def train():
     args = parse_args()
     _check_split_files()
-    
-    # ── Load config for image_size if not overridden ─────────────────────────
-    config = _load_config()
-    if args.img_size == 256:  # default value, check config
-        config_img_size = config.get("data", {}).get("image_size", 256)
-        args.img_size = config_img_size
 
-    # ── Override other CLI defaults from config if not explicitly provided ──
-    train_cfg = config.get("training", {})
-    # Only override when user left the CLI default value
+    data_cfg = config.get("data") or {}
+    train_cfg = config.get("training") or {}
+    dl_cfg = config.get("dataloader") or {}
+
+    if args.img_size == 256:
+        args.img_size = data_cfg.get("image_size", 256)
+
     if args.batch == 8:
         args.batch = train_cfg.get("batch_size", args.batch)
     if args.epochs == 100:
@@ -147,11 +131,12 @@ def train():
     if abs(args.enc_lr - 1e-5) < 1e-12:
         args.enc_lr = train_cfg.get("enc_lr", args.enc_lr)
     if args.workers == 4:
-        args.workers = config.get("dataloader", {}).get("num_workers", args.workers)
+        args.workers = dl_cfg.get("num_workers", args.workers)
     if args.device == "auto":
         args.device = train_cfg.get("device", args.device)
     args.no_amp = train_cfg.get("no_amp", args.no_amp)
-    # ── Device ────────────────────────────────────────────────────────────────
+
+    # Device
     if args.device == "auto":
         if torch.cuda.is_available():
             device = torch.device("cuda")
@@ -162,16 +147,12 @@ def train():
     else:
         device = torch.device(args.device)
 
-    # AMP: enable on CUDA by default (faster + lower memory). Can be disabled
-    # with `--no_amp` if you encounter instability.
     use_amp = (not args.no_amp) and (device.type == "cuda")
 
-    # Windows: cap workers to avoid spawn issues
     if platform.system() == "Windows" and args.workers > 0:
         args.workers = min(args.workers, 4)
     use_persistent = args.workers > 0 and platform.system() != "Windows"
 
-    # ── Header ────────────────────────────────────────────────────────────────
     print(f"\n  {'═' * W}")
     print(f"  {'Relighty — Face Shadow Removal':^{W}}")
     print(f"  {'═' * W}")
@@ -184,35 +165,34 @@ def train():
     print(f"  Epochs   : {args.epochs}   Batch : {args.batch}   LR : {args.lr}")
     print(f"  {'─' * W}")
 
-    # ── Checkpoints ───────────────────────────────────────────────────────────
+    # Checkpoints
+    CKPT_DIR = get_checkpoint_path()
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
     latest_ckpt = CKPT_DIR / "shadow_removal_latest.pth"
     best_ckpt   = CKPT_DIR / "shadow_removal_best.pth"
 
-    # ── Config & Logging ──────────────────────────────────────────────────────
-    config = _load_config()
-    log_dir = ROOT / (config.get("logging", {}).get("log_dir", "logs"))
+    # Logging
+    log_dir = get_log_path()
     log_file = _setup_logging(log_dir)
     print(f"  Logs     : {log_file}")
-    
-    # Early stopping config
-    early_stop_cfg = config.get("early_stopping", {})
+
+    # Early stopping
+    early_stop_cfg = config.get("early_stopping") or {}
     early_stop_enabled = early_stop_cfg.get("enabled", True)
     early_stop_patience = early_stop_cfg.get("patience", 15)
-    early_stop_min_delta = early_stop_cfg.get("min_delta", 0.0001)
     patience_counter = 0
 
-    # ── Data ──────────────────────────────────────────────────────────────────
+    # Data
     print("  Loading dataset ...", end=" ", flush=True)
     train_ds = ShadowDataset(
-        SPLIT_DIR / "train_input.txt",
-        SPLIT_DIR / "train_target.txt",
+        str(get_split_path("train_input.txt")),
+        str(get_split_path("train_target.txt")),
         augment=True,
         image_size=args.img_size,
     )
     val_ds = ShadowDataset(
-        SPLIT_DIR / "val_input.txt",
-        SPLIT_DIR / "val_target.txt",
+        str(get_split_path("val_input.txt")),
+        str(get_split_path("val_target.txt")),
         augment=False,
         image_size=args.img_size,
     )
@@ -230,7 +210,7 @@ def train():
         persistent_workers=use_persistent,
     )
 
-    # ── Model ─────────────────────────────────────────────────────────────────
+    # Model
     print("  Building model ...", end=" ", flush=True)
     model = ShadowRemovalNet().to(device)
     total_params = sum(p.numel() for p in model.parameters()) / 1e6
@@ -247,7 +227,7 @@ def train():
     scaler    = torch.amp.GradScaler(device=device.type, enabled=use_amp)
     criterion = CombinedLoss(l1_weight=1.0, ssim_weight=0.5).to(device)
 
-    # ── Resume ────────────────────────────────────────────────────────────────
+    # Resume
     start_epoch   = 1
     best_val_loss = float("inf")
 
@@ -262,7 +242,7 @@ def train():
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
         print(f"epoch {ckpt['epoch']}  best_val={best_val_loss:.4f}")
 
-    # ── Training loop ─────────────────────────────────────────────────────────
+    # Training loop
     n_train = len(train_loader)
     n_val   = len(val_loader)
 
@@ -273,7 +253,7 @@ def train():
     for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
 
-        # ── Train ─────────────────────────────────────────────────────────────
+        # Train
         model.train()
         train_loss = 0.0
         grad_norm_avg = 0.0
@@ -297,13 +277,11 @@ def train():
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            # Check for NaN or inf gradients
             has_nan_inf = any(
                 torch.isnan(p.grad).any() or torch.isinf(p.grad).any()
                 for p in model.parameters() if p.grad is not None
             )
             if has_nan_inf:
-                # Skip this batch if gradients are invalid
                 scaler.update()
                 gn = float('nan')
             else:
@@ -321,7 +299,7 @@ def train():
         train_loss    /= n_train
         grad_norm_avg /= n_train
 
-        # ── Validate ──────────────────────────────────────────────────────────
+        # Validate
         model.eval()
         val_loss = 0.0
 
@@ -353,9 +331,8 @@ def train():
         if is_best:
             best_val_loss = val_loss
 
-        cur_lr = optimizer.param_groups[1]["lr"]   # decoder LR
+        cur_lr = optimizer.param_groups[1]["lr"]
 
-        # ── Epoch summary ─────────────────────────────────────────────────────
         star = "  ★" if is_best else ""
         print(
             f"  [{epoch:>3}/{args.epochs}]"
@@ -367,7 +344,7 @@ def train():
             f"{star}"
         )
 
-        # ── Save checkpoints ──────────────────────────────────────────────────
+        # Save checkpoints
         state = dict(
             epoch         = epoch,
             model         = model.state_dict(),
@@ -388,36 +365,33 @@ def train():
             torch.save(state, ep_path)
             print(f"           → ckpt  : {ep_path.name}")
 
-        # ── Early Stopping ────────────────────────────────────────────────────
+        # Early stopping
         if early_stop_enabled:
             if is_best:
-                # Improvement detected - reset counter
                 patience_counter = 0
             else:
-                # No improvement - increment counter
                 patience_counter += 1
                 if patience_counter >= early_stop_patience:
                     print(f"           ⚠ Early stopping: no improvement for {patience_counter} epochs")
                     break
 
-        # ── Log to CSV ────────────────────────────────────────────────────────
+        # Log to CSV
         with open(log_file, "a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
-                epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", 
-                f"{best_val_loss:.6f}", f"{cur_lr:.2e}", 
-                f"{grad_norm_avg:.4f}", f"{elapsed:.1f}", 
+                epoch, f"{train_loss:.6f}", f"{val_loss:.6f}",
+                f"{best_val_loss:.6f}", f"{cur_lr:.2e}",
+                f"{grad_norm_avg:.4f}", f"{elapsed:.1f}",
                 int(is_best)
             ])
 
-    # ── Done ──────────────────────────────────────────────────────────────────
     print(f"\n  {'═' * W}")
     print(f"  Training complete!")
     print(f"  Best val loss : {best_val_loss:.4f}")
     print(f"  Best model    : {best_ckpt.name}")
     print(f"  {'─' * W}")
     print(f"  Run inference :")
-    print(f"    python evaluation/inference.py --input Results/input")
+    print(f"    python -m evaluation.inference --input Results/input")
     print(f"  {'═' * W}\n")
 
 

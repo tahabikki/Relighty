@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -9,13 +10,17 @@ import json
 import mediapipe as mp
 import subprocess
 import torch
-from models.shadow_remover import ShadowRemovalNet
+import yaml
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 from rembg import remove
-from masking.mediapipe_mask import FaceMaskGenerator
 
-_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from models.shadow_remover import ShadowRemovalNet
+from masking_bg.mediapipe_mask import FaceMaskGenerator
+from masking_bg.face_neck_mask import create_face_neck_mask
 
 
 def ensure_model(path):
@@ -38,10 +43,10 @@ def parse_args():
     return parser.parse_args()
 
 
-FACE_MODEL = str(_ROOT / "models" / "deploy.prototxt")
-FACE_WEIGHTS = str(_ROOT / "models" / "res10_300x300_ssd_iter_140000.caffemodel")
-LANDMARK_MODEL = str(_ROOT / "models" / "lbfmodel.yaml")
-SHADOW_MODEL_PATH = str(_ROOT / "checkpoints" / "shadow_removal_best.pth")
+FACE_MODEL = str(PROJECT_ROOT / "models" / "deploy.prototxt")
+FACE_WEIGHTS = str(PROJECT_ROOT / "models" / "res10_300x300_ssd_iter_140000.caffemodel")
+LANDMARK_MODEL = str(PROJECT_ROOT / "models" / "lbfmodel.yaml")
+SHADOW_MODEL_PATH = str(PROJECT_ROOT / "checkpoints" / "shadow_removal_best.pth")
 SHADOW_INPUT_SIZE = 512
 _shadow_model = None
 
@@ -78,7 +83,7 @@ def get_landmarks(image, net, facemark):
 
 #  SEGMENTATION
 BASE_OPTIONS = mp_python.BaseOptions(
-    model_asset_path="models/selfie_segmentation.tflite"
+    model_asset_path=str(PROJECT_ROOT / "postprocessing" / "selfie_segmenter.tflite")
 )
 SEGMENTER_OPTIONS = vision.ImageSegmenterOptions(
     base_options=BASE_OPTIONS,
@@ -86,7 +91,7 @@ SEGMENTER_OPTIONS = vision.ImageSegmenterOptions(
     running_mode=vision.RunningMode.IMAGE,
 )
 def get_segmentation_mask(image):
-    ensure_model("models/selfie_segmentation.tflite")
+    ensure_model(str(PROJECT_ROOT / "models" / "selfie_segmentation.tflite"))
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
     with vision.ImageSegmenter.create_from_options(SEGMENTER_OPTIONS) as segmenter:

@@ -1,177 +1,182 @@
-# Relighty — Face Shadow Removal
+# Relighty — Face and Neck Shadow Removal
 
-A deep learning project for automatic shadow removal from face images using U-Net with ResNet34 backbone.
+A modular deep learning project for automatic shadow removal from face and neck regions using U-Net with ResNet34 backbone.
 
-## Prerequisites
+## Features
 
-- **Python 3.12+**
-- **CUDA 12.4** (for GPU acceleration, optional)
-- **Git** (to clone the repository)
+- **Transparent Background** - PNG output with alpha channel
+- **Face + Neck + Forehead** - All connected as one piece
+- **Texture Preservation** - Keeps original skin texture while removing shadows
+- **Cross-Platform** - Works on Windows, macOS, and Linux (CUDA, MPS, CPU)
+- **Config-Driven** - All paths from one config file
 
-## Installation
+---
 
-### 1. Clone the Repository
-```bash
-git clone <repository-url>
-cd Relighty
+## Quick Start
+
+### Step 1: Configure Dataset Path
+
+Edit `configs/config.yaml`:
+
+```yaml
+data:
+  dataset_root: dataset  # or absolute path: /path/to/your/dataset
 ```
 
-### 2. Create Virtual Environment
-```bash
-# Windows
-python -m venv .venv
-.venv\Scripts\activate
-
-# macOS / Linux
-python -m venv .venv
-source .venv/bin/activate
-```
-
-### 3. Install Dependencies
-
-**Recommended: Use Setup Scripts (includes PyTorch)**
+### Step 2: Prepare Dataset (PNG with transparent background)
 
 ```bash
-# Windows (CUDA 12.4)
-setup.bat
+# Remove background from input images
+python -m masking_bg.mask_bg_remove --input-folder dataset/input --output-folder dataset/input
 
-# macOS / Linux
-bash setup.sh
+# Remove background from target images
+python -m masking_bg.mask_bg_remove --input-folder dataset/target --output-folder dataset/target
 ```
 
-**Manual Installation:**
+### Step 3: Create Train/Val Split
+
 ```bash
-# Install PyTorch first
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124  # CUDA 12.4
-# or for CPU only
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-
-# Install other dependencies
-pip install -r requirements.txt
+python -m utils.split
 ```
+
+### Step 4: Train the Model
+
+```bash
+python -m training.train
+```
+
+### Step 5: Run Inference (PNG with transparent background)
+
+```bash
+# Single image
+python -m evaluation.inference --input photo.jpg --output result.png
+
+# Batch folder
+python -m evaluation.inference --input Results/input --output Results/output
+
+# Or use deployment pipeline
+python -m deployment.pipeline --input photo.jpg --output result.png
+```
+
+---
+
+## Complete Pipeline
+
+### Training Flow
+```
+Input Image → mask_bg_remove.py → PNG with transparent BG
+                                           ↓
+                                    dataset/input/
+                                    dataset/target/
+                                           ↓
+                              python -m utils.split
+                                           ↓
+                              dataset/splits/ (train/val files)
+                                           ↓
+                              python -m training.train
+                                           ↓
+                              checkpoints/ (model weights)
+```
+
+### Inference Flow
+```
+Input Image → mask_bg_remove.py → Get mask (face+neck+forehead)
+                                              ↓
+                           ShadowRemovalNet → Shadow-free image
+                                              ↓
+                           fix_light.py → Fix lighting + preserve texture
+                                              ↓
+                           Output: PNG with transparent BG (no shadows, good texture)
+```
+
+---
+
+## Configuration
+
+All settings in `configs/config.yaml`:
+
+```yaml
+# Dataset paths - EDIT THIS TO DEPLOY ANYWHERE
+data:
+  dataset_root: dataset         # or absolute path: /path/to/dataset
+  input_subdir: input           # folder with input images
+  target_subdir: target         # folder with target images
+  splits_dir: dataset/splits
+
+# Training
+training:
+  batch_size: 4
+  epochs: 200
+  device: auto                 # auto, cuda, cpu, mps
+
+# Image size
+model:
+  input_size: 256
+```
+
+---
 
 ## Project Structure
 
 ```
 Relighty/
-├── configs/              # Configuration files
-│   └── config.yaml       # Training hyperparameters
-├── models/               # Model definitions
-│   └── shadow_remover.py
-├── train/                # Training script
-│   └── train.py
-├── evaluation/           # Evaluation & inference
-│   ├── evaluate.py
-│   └── inference.py
-├── utils/                # Utility functions
-│   ├── dataset.py
-│   ├── losses.py
-│   ├── color_utils.py
-│   └── face_analyzer.py
-├── dataset/              # Dataset folder
-│   ├── input/            # Original images with shadows
-│   ├── target/           # Shadow-free reference images
-│   └── splits/           # Train/val split files
-├── checkpoints/          # Trained model weights
-│   └── 1-100/           # Models from epochs 1-100
-├── Results/              # Output results
-├── requirements.txt      # Python dependencies
-├── setup.bat             # Windows setup
-└── setup.sh              # Linux/macOS setup
+├── configs/
+│   └── config.yaml              # All configuration
+├── data/
+│   ├── input/                   # PNG with transparent background
+│   ├── target/                  # PNG with transparent background
+│   └── splits/                 # Train/val split files
+├── checkpoints/                 # Model checkpoints
+├── logs/                        # Training logs
+├── models/
+│   └── shadow_remover.py       # U-Net + ResNet34
+├── masking_bg/
+│   ├── mask_bg_remove.py      # Creates PNG with transparency
+│   ├── face_neck_mask.py       # Face+Neck+Forehead mask
+│   └── mediapipe_mask.py       # Face detection
+├── training/
+│   ├── train.py                # Training script
+│   ├── dataset.py              # Uses PNG with alpha channel
+│   └── losses.py               # L1 + SSIM loss
+├── evaluation/
+│   ├── evaluate.py             # Model evaluation
+│   └── inference.py            # Inference (PNG output)
+├── deployment/
+│   └── pipeline.py            # End-to-end pipeline
+└── postprocessing/
+    └── fix_light.py           # Texture preservation + lighting fix
 ```
 
-## Quick Start
+---
 
-### 1. Prepare Dataset
-
-Place your images in:
-- `dataset/input/` — images with shadows
-- `dataset/target/` — shadow-free images
-
-The dataset splits (train/val) are configured in:
-- `dataset/splits/train_input.txt`
-- `dataset/splits/train_target.txt`
-- `dataset/splits/val_input.txt`
-- `dataset/splits/val_target.txt`
-
-### 2. Configure Training
-
-Edit `configs/config.yaml` to adjust:
-- Model architecture
-- Batch size & learning rate
-- Training epochs
-- Device (cuda/cpu/mps)
-
-### 3. Train Model
+## Options for mask_bg_remove.py
 
 ```bash
-python train/train.py
+# Face + Neck + Forehead (default)
+python -m masking_bg.mask_bg_remove --input photo.jpg --output no_bg.png
+
+# Face only (no neck, no forehead)
+python -m masking_bg.mask_bg_remove --input photo.jpg --output no_bg.png --mask-mode face
+
+# No forehead extension
+python -m masking_bg.mask_bg_remove --input photo.jpg --output no_bg.png --no-forehead
+
+# Sharper edges (no feathering)
+python -m masking_bg.mask_bg_remove --input photo.jpg --output no_bg.png --no-feather
 ```
 
-Models are saved to `checkpoints/1-100/` every 10 epochs (configurable).
-
-### 4. Evaluate & Run Inference
-
-```bash
-# Evaluate on validation set
-python evaluation/evaluate.py
-
-# Run inference on test images
-python evaluation/inference.py --input <image-path> --output <output-dir>
-```
-
-## Pretrained Models
-
-Pre-trained checkpoints are included in `checkpoints/1-100/`:
-- `shadow_removal_best.pth` — Best validation performance
-- `shadow_removal_latest.pth` — Latest checkpoint
-- `shadow_removal_epoch_*.pth` — Individual epoch checkpoints
-
-## Configuration
-
-Key settings in `configs/config.yaml`:
-
-```yaml
-model:
-  name: unet_resnet34
-  input_size: 256
-  channels: 3
-
-training:
-  batch_size: 64
-  epochs: 200
-  lr: 0.0001
-  device: auto  # auto | cuda | cpu | mps
-
-early_stopping:
-  enabled: true
-  patience: 15
-```
-
-## System Requirements
-
-| Component | Minimum | Recommended |
-|-----------|---------|------------|
-| RAM | 4GB | 16GB+ |
-| GPU VRAM | N/A | 4GB+ (CUDA) |
-| Disk | 5GB | 20GB+ |
+---
 
 ## Troubleshooting
 
-**Issue: ModuleNotFoundError for torch**
-- Run: `pip install torch torchvision`
+| Problem | Solution |
+|---------|----------|
+| Change dataset path | Edit `configs/config.yaml` - no code changes! |
+| DataLoader issues on Windows | Set `num_workers: 0` in config |
+| No GPU | Set `device: cpu` in config |
 
-**Issue: CUDA not available**
-- Verify NVIDIA GPU drivers are installed
-- Or switch to CPU mode in `config.yaml`
-
-**Issue: DataLoader errors on Windows**
-- Set `num_workers: 0` in `config.yaml`
+---
 
 ## License
 
-[Add your license here]
-
-## Author
-
-Relighty Development Team
+[Your License]

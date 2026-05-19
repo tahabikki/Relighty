@@ -1,8 +1,20 @@
+# =============================================================================
+# Relighty - Face Shadow Removal Configuration
+# =============================================================================
+# All paths are relative to PROJECT_ROOT unless absolute paths are provided.
+# To deploy in any environment, only modify this config file.
+
+# =============================================================================
+# Model Configuration
+# =============================================================================
 model:
   name: unet_resnet34
-  input_size: 512
+  input_size: 256
   channels: 3
 
+# =============================================================================
+# Training Configuration
+# =============================================================================
 training:
   batch_size: 4
   epochs: 200
@@ -12,39 +24,72 @@ training:
   optimizer: AdamW
   weight_decay: 0.0001
   save_every: 10
-  device: auto          # auto | cuda | cpu | mps
+  device: auto                    # auto, cuda, cpu, mps
 
+# =============================================================================
+# Early Stopping Configuration
+# =============================================================================
 early_stopping:
   enabled: true
-  patience: 15          # stop if val loss doesn't improve for N epochs
-  min_delta: 0.0001     # min change to qualify as improvement
+  patience: 15
+  min_delta: 0.0001
 
+# =============================================================================
+# Logging Configuration
+# =============================================================================
 logging:
-  log_dir: logs         # relative to project root
-  save_frequency: 1     # save logs every N batches
+  log_dir: logs                   # relative to project root
+  save_frequency: 1
 
+# =============================================================================
+# DataLoader Configuration
+# =============================================================================
 dataloader:
-  num_workers: 0        # set 0 on Windows if you have issues
+  num_workers: 0                  # set 0 on Windows if you have issues
   pin_memory: true
   persistent_workers: true
 
+# =============================================================================
+# Loss Configuration
+# =============================================================================
 loss:
   l1_weight: 1.0
   ssim_weight: 0.5
 
+# =============================================================================
+# Data Paths Configuration - EDIT THIS FOR YOUR ENVIRONMENT
+# =============================================================================
 data:
-  dataset_dir: dataset
-  input_subdir: input
-  target_subdir: target
+  # Dataset root directory (where input/ and target/ folders are)
+  # Use absolute path or relative to project root
+  # After running mask_bg_remove, use dataset:
+  dataset_root: dataset
+
+  # Subdirectories within dataset_root
+  input_subdir: input             # images with shadows (PNG with transparent)
+  target_subdir: target           # target images (shadow-free, PNG with transparent)
+
+  # Where to save the train/val split files
   splits_dir: dataset/splits
-  image_size: 512
+
+  # Image processing
+  image_size: 256
   train_ratio: 0.85
   seed: 42
 
+# =============================================================================
+# Checkpoint Configuration
+# =============================================================================
 checkpoint:
-  dir: checkpoints
+  dir: checkpoints               # where to save model checkpoints
   save_every: 10
 
+# =============================================================================
+# Inference Configuration
+# =============================================================================
 inference:
-  output_dir: Results/output
-  input_dir: Results/input
+  output_dir: Results/output     # where to save inference results
+  input_dir: Results/input       # where to read images for batch inference
+  texture_preservation: true
+  default_device: auto
+  auto_checkpoint: true          # automatically find best checkpoint

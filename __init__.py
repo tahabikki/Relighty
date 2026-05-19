@@ -1,5 +1,5 @@
 from models.shadow_remover import ShadowRemovalNet
-from masking.mediapipe_mask import FaceMaskGenerator
+from masking_bg.mediapipe_mask import FaceMaskGenerator
 from postprocessing.fix_light import fix_light
 from postprocessing.bg_remove import remove_background
 

@@ -11,8 +11,12 @@ import numpy as np
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.core.base_options import BaseOptions
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+from utils.config_loader import get_config, get_data_path
+
+config = get_config()
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/"
@@ -21,9 +25,14 @@ MODEL_URL = (
 MODEL_PATH = PROJECT_ROOT / "postprocessing" / "selfie_segmenter.tflite"
 
 
+def get_project_root() -> Path:
+    """Return project root directory."""
+    return PROJECT_ROOT
+
+
 def parse_args() -> argparse.Namespace:
-    default_input_root = PROJECT_ROOT / "dataset"
-    default_output_root = PROJECT_ROOT / "dataset_no_bg"
+    default_input_root = get_data_path("dataset_root")
+    default_output_root = PROJECT_ROOT / "data" / "dataset_no_bg"
 
     parser = argparse.ArgumentParser(
         description="Remove image backgrounds from dataset/input and dataset/target using a MediaPipe person-segmentation task."

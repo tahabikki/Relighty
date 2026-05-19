@@ -2,13 +2,13 @@
 """
 Evaluate the shadow removal model on the validation split.
 
-Computes per-image PSNR and SSIM inside the face mask,
-prints a summary, and writes results to Results/evaluation_results.txt.
+Computes per-image PSNR and SSIM on the face+neck region
+(using PNG with transparent background from mask_bg_remove approach).
 
 Usage
-─────
-    python evaluation/evaluate.py
-    python evaluation/evaluate.py --checkpoint checkpoints/shadow_removal_best.pth
+────
+    python -m evaluation.evaluate
+    python -m evaluation.evaluate --checkpoint checkpoints/shadow_removal_best.pth
 """
 import sys
 from pathlib import Path
@@ -16,42 +16,36 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
+from utils.config_loader import get_config, get_split_path, get_checkpoint_path, get_inference_output_path
 from models.shadow_remover import ShadowRemovalNet
 from training.dataset import ShadowDataset
 from training.losses import CombinedLoss
 
-SPLIT_DIR = ROOT / "dataset" / "splits"
-CKPT_DIR  = ROOT / "checkpoints"
+config = get_config()
 
 
-# ─── Metrics ──────────────────────────────────────────────────────────────────
-
-def masked_psnr(pred: torch.Tensor, target: torch.Tensor,
-                mask: torch.Tensor) -> float:
-    """PSNR (dB) computed on the masked (face) region only."""
-    m   = mask.expand_as(pred)
+def masked_psnr(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> float:
+    """PSNR (dB) computed on the masked (face+neck) region only."""
+    m = mask.expand_as(pred)
     mse = ((pred - target) ** 2 * m).sum() / (m.sum() + 1e-8)
     if mse < 1e-10:
         return 100.0
     return (10.0 * torch.log10(torch.tensor(1.0) / mse)).item()
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
-
 def main():
     import argparse
     p = argparse.ArgumentParser(description="Shadow removal evaluation")
-    p.add_argument("--checkpoint", default=None, help="Path to .pth checkpoint")
-    p.add_argument("--batch",      type=int, default=8)
-    p.add_argument("--workers",    type=int, default=4)
-    p.add_argument("--device",     default="auto")
-    p.add_argument("--img_size",   type=int, default=256)
+    p.add_argument("--checkpoint", default=None)
+    p.add_argument("--batch", type=int, default=8)
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--device", default="auto")
+    p.add_argument("--img_size", type=int, default=256)
     args = p.parse_args()
 
-    # Device (auto: CUDA → MPS → CPU)
     if args.device == "auto":
         if torch.cuda.is_available():
             device = torch.device("cuda")
@@ -62,55 +56,52 @@ def main():
     else:
         device = torch.device(args.device)
 
-    # Find checkpoint
     ckpt_path = args.checkpoint
     if ckpt_path is None:
-        best = CKPT_DIR / "shadow_removal_best.pth"
+        best = get_checkpoint_path("shadow_removal_best.pth")
         if best.exists():
             ckpt_path = str(best)
         else:
-            ckpts = sorted(CKPT_DIR.glob("*.pth"))
+            ckpts = sorted(get_checkpoint_path().glob("*.pth"))
             ckpt_path = str(ckpts[-1]) if ckpts else None
     if ckpt_path is None:
-        print("ERROR: No checkpoint found. Train the model first:\n  python train/train.py")
+        print("ERROR: No checkpoint found. Train first: python -m training.train")
         sys.exit(1)
 
     print(f"\nEvaluating: {ckpt_path}")
     print(f"Device    : {device}\n")
 
-    # Load model
     model = ShadowRemovalNet().to(device)
-    raw   = torch.load(ckpt_path, map_location=device, weights_only=False)
+    raw = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(raw.get("model", raw))
     model.eval()
 
-    # Data
+    data_cfg = config.get("data") or {}
+    img_size = args.img_size or data_cfg.get("image_size", 256)
+
     val_ds = ShadowDataset(
-        SPLIT_DIR / "val_input.txt",
-        SPLIT_DIR / "val_target.txt",
+        str(get_split_path("val_input.txt")),
+        str(get_split_path("val_target.txt")),
         augment=False,
-        image_size=args.img_size,
+        image_size=img_size,
     )
-    loader = DataLoader(val_ds, batch_size=args.batch, shuffle=False,
-                        num_workers=args.workers)
+    loader = DataLoader(val_ds, batch_size=args.batch, shuffle=False, num_workers=args.workers)
     criterion = CombinedLoss().to(device)
 
     total_loss = total_psnr = total_ssim = 0.0
     n = 0
     with torch.no_grad():
         for inp, tgt, mask in loader:
-            inp, tgt, mask = (
-                inp.to(device), tgt.to(device), mask.to(device)
-            )
-            pred    = model(inp)
-            loss    = criterion(pred, tgt, mask)
+            inp, tgt, mask = inp.to(device), tgt.to(device), mask.to(device)
+            pred = model(inp)
+            loss = criterion(pred, tgt, mask)
             metrics = criterion.metrics(pred, tgt, mask)
-            bs      = inp.size(0)
+            bs = inp.size(0)
 
             total_loss += loss.item() * bs
             total_psnr += masked_psnr(pred, tgt, mask) * bs
             total_ssim += metrics["ssim"] * bs
-            n          += bs
+            n += bs
 
     avg_loss = total_loss / max(n, 1)
     avg_psnr = total_psnr / max(n, 1)
@@ -123,9 +114,8 @@ def main():
     print(f"  SSIM     : {avg_ssim:.4f}")
     print(f"{'─'*40}\n")
 
-    # Save to Results/
-    results_dir = ROOT / "Results"
-    results_dir.mkdir(exist_ok=True)
+    results_dir = get_inference_output_path().parent
+    results_dir.mkdir(parents=True, exist_ok=True)
     out_file = results_dir / "evaluation_results.txt"
     with open(out_file, "w") as f:
         f.write(f"Checkpoint : {ckpt_path}\n")
