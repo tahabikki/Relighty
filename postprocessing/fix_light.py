@@ -219,6 +219,168 @@ _JAWLINE = [
 ]
 
 
+# ─── EXACT SAME neck mask logic as user's code ────────────────────────────
+
+def _normalize_luminosity(image):
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    normalized = cv2.merge([l, a, b])
+    return cv2.cvtColor(normalized, cv2.COLOR_LAB2BGR)
+
+
+def _enforce_symmetry(mask, center_x):
+    h, w = mask.shape
+    left_half = mask[:, :center_x]
+    right_half = mask[:, center_x:]
+    
+    # Fix: handle case when halves have different sizes
+    min_w = min(left_half.shape[1], right_half.shape[1])
+    if min_w == 0:
+        return mask
+    
+    left_half = left_half[:, :min_w]
+    right_half = right_half[:, :min_w]
+    
+    right_half_flipped = cv2.flip(right_half, 1)
+    left_half_flipped = cv2.flip(left_half, 1)
+    left_pixels = cv2.countNonZero(left_half)
+    right_pixels = cv2.countNonZero(right_half)
+    if left_pixels > right_pixels * 1.5:
+        merged = np.hstack([left_half, left_half_flipped])
+    elif right_pixels > left_pixels * 1.5:
+        merged = np.hstack([right_half_flipped, right_half])
+    else:
+        combined = cv2.bitwise_or(left_half, right_half_flipped)
+        combined_right = cv2.bitwise_or(right_half, left_half_flipped)
+        merged = np.hstack([combined, combined_right])
+    
+    # Pad back to original width
+    if merged.shape[1] < w:
+        pad = np.zeros((h, w - merged.shape[1]), dtype=merged.dtype)
+        merged = np.hstack([merged, pad])
+    return merged
+
+
+def _suppress_clothing_boundary(mask, image, neck_bottom_y):
+    h, w = mask.shape
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    
+    # Fix: ensure same size and type
+    if edges.shape != mask.shape:
+        edges = cv2.resize(edges, (w, h))
+    
+    lower_region = np.zeros((h, w), dtype=np.uint8)
+    boundary_y = neck_bottom_y + int(h * 0.15)
+    lower_polygon = np.array([
+        [0, boundary_y], [w, boundary_y], [w, h], [0, h]
+    ], dtype=np.int32)
+    cv2.fillPoly(lower_region, [lower_polygon], 255)
+    edges_lower = cv2.bitwise_and(edges, lower_region)
+    kernel = np.ones((5, 5), np.uint8)
+    edges_dilated = cv2.dilate(edges_lower, kernel, iterations=2)
+    suppressed = cv2.bitwise_and(mask, cv2.bitwise_not(edges_dilated))
+    return suppressed
+
+
+def _create_neck_mask_exact(image: np.ndarray, face_pts: np.ndarray) -> np.ndarray:
+    """EXACT same mask logic as user's create_neck_mask function."""
+    h, w = image.shape[:2]
+    
+    if face_pts is None or len(face_pts) < 478:
+        return np.zeros((h, w), dtype=np.float32)
+    
+    # Jaw indices (same as user's code)
+    jaw_indices = [234, 93, 132, 58, 172, 136, 150, 149, 176, 148, 152, 377, 400, 378, 379, 365, 397, 288, 361, 323, 454]
+    jaw_pts = np.array([[int(face_pts[idx, 0]), int(face_pts[idx, 1])] for idx in jaw_indices], dtype=np.int32)
+    
+    chin_indices = [152, 377, 400, 148, 176, 149, 150, 136, 172, 58]
+    chin_pts = np.array([[int(face_pts[idx, 0]), int(face_pts[idx, 1])] for idx in chin_indices], dtype=np.int32)
+    
+    face_width = np.linalg.norm(jaw_pts[0] - jaw_pts[-1])
+    neck_center_x = int(np.mean(jaw_pts[:, 0]))
+    neck_bottom_y = int(np.max(chin_pts[:, 1]))
+    neck_top_y = int(np.min(chin_pts[:, 1]))
+    
+    # Sobel edge detection for jaw line (exact same)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    abs_sobel = np.uint8(np.absolute(sobelx))
+    _, jaw_edges = cv2.threshold(abs_sobel, 25, 255, cv2.THRESH_BINARY)
+    
+    jaw_line_mask = np.zeros((h, w), dtype=np.uint8)
+    jaw_top = neck_top_y - 20
+    jaw_bottom = neck_top_y + 30
+    jaw_polygon = np.array([
+        [0, max(0, jaw_top)], [w, max(0, jaw_top)], [w, min(h, jaw_bottom)], [0, min(h, jaw_bottom)]
+    ], dtype=np.int32)
+    cv2.fillPoly(jaw_line_mask, [jaw_polygon], 255)
+    jaw_edge_detected = cv2.bitwise_and(jaw_edges, jaw_line_mask)
+    
+    kernel_h = np.ones((1, 5), np.uint8)
+    jaw_edge_dilated = cv2.dilate(jaw_edge_detected, kernel_h, iterations=2)
+    
+    # Neck polygon geometry (exact same)
+    shoulder_y = min(h - 1, neck_bottom_y + int(face_width * 2.5))
+    shoulder_extend = int(face_width * 1.2)
+    left_shoulder = [neck_center_x - shoulder_extend, shoulder_y]
+    right_shoulder = [neck_center_x + shoulder_extend, shoulder_y]
+    
+    neck_polygon = np.vstack([jaw_pts, right_shoulder, left_shoulder])
+    geo_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(geo_mask, [neck_polygon.astype(np.int32)], 255)
+    
+    # YCrCb skin detection - NO normalize_luminosity, direct on original
+    ycrcb = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
+    ycrcb_lower = np.array([0, 133, 77])
+    ycrcb_upper = np.array([255, 173, 127])
+    skin_mask = cv2.inRange(ycrcb, ycrcb_lower, ycrcb_upper)
+    
+    skin_with_jaw = cv2.bitwise_and(skin_mask, cv2.bitwise_not(jaw_edge_dilated))
+    final_mask = cv2.bitwise_and(geo_mask, skin_with_jaw)
+    
+    # Erode (exact same)
+    eroded = cv2.erode(final_mask, np.ones((11, 11), np.uint8), iterations=1)
+    if cv2.countNonZero(eroded) > 100:
+        final_mask = eroded
+    else:
+        final_mask = cv2.erode(geo_mask, np.ones((15, 15), np.uint8), iterations=2)
+    
+    # Enforce symmetry (exact same)
+    final_mask = _enforce_symmetry(final_mask, neck_center_x)
+    
+    # Suppress clothing boundary (exact same)
+    final_mask = _suppress_clothing_boundary(final_mask, image, neck_bottom_y)
+    
+    # Morphology cleanup (exact same)
+    kernel = np.ones((7, 7), np.uint8)
+    final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, kernel)
+    final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    
+    # Connected components (exact same)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(final_mask, connectivity=8)
+    if num_labels > 1:
+        jaw_y = int(np.max(jaw_pts[:, 1]))
+        largest_label = 1
+        largest_area = 0
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            y_pos = stats[i, cv2.CC_STAT_TOP]
+            if area > largest_area and y_pos < jaw_y + 150:
+                largest_area = area
+                largest_label = i
+        final_mask = (labels == largest_label).astype(np.uint8) * 255
+    
+    # 101x101 blur (exact same as user's code)
+    blurred = cv2.GaussianBlur(final_mask, (101, 101), 0)
+    return blurred.astype(np.float32) / 255.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def _build_neck_mask_smart(face_pts: np.ndarray, h: int, w: int) -> np.ndarray:
     """
     Build a precise neck mask from actual MediaPipe jawline landmarks.
@@ -241,37 +403,37 @@ def _build_neck_mask_smart(face_pts: np.ndarray, h: int, w: int) -> np.ndarray:
     jaw_pts = face_pts[_JAWLINE].copy()
     jaw_pts = jaw_pts[jaw_pts[:, 0].argsort()]
 
-    # Neck depth proportional to face height
-    neck_depth = int(face_h * 0.42)
-
-    # Top edge  = actual jawline curve
-    top_edge    = jaw_pts.astype(np.float32)
-    # Bottom edge = same curve pushed straight down
-    bottom_edge = top_edge.copy()
-    bottom_edge[:, 1] = np.clip(bottom_edge[:, 1] + neck_depth, 0, h - 1)
-
-    # Closed polygon: top L→R then bottom R→L
-    poly = np.vstack([top_edge, bottom_edge[::-1]]).astype(np.int32)
+    # Build neck mask from jawline - exact same logic as face mask
+    jaw_pts = face_pts[_JAWLINE].copy()
+    
+    # Left/right: from jawline landmarks
+    jaw_left_x = jaw_pts[:, 0].min()
+    jaw_right_x = jaw_pts[:, 0].max()
+    chin_y = jaw_pts[:, 1].max()
+    
+    # Same process as face: polygon, fill, blur
+    neck_left = jaw_left_x
+    neck_right = jaw_right_x
+    neck_depth = int(face_h * 0.28)
+    
+    poly = np.array([
+        [neck_left, chin_y],
+        [neck_right, chin_y],
+        [neck_right, chin_y + neck_depth],
+        [neck_left, chin_y + neck_depth]
+    ], dtype=np.int32)
 
     neck_mask = np.zeros((h, w), dtype=np.float32)
     cv2.fillPoly(neck_mask, [poly], 1.0)
-
-    # Zero out the face zone (above the highest jaw point) so no overlap with face mask
-    chin_y = int(jaw_pts[:, 1].min())
-    neck_mask[:chin_y, :] = 0.0
-
-    # Apply vertical gradient: strongest at chin, fades to zero at bottom
-    neck_binary = (neck_mask > 0).astype(np.float32)
+    
+    # Stronger at chin (shadow zone), fades toward bottom
     ys = np.arange(h, dtype=np.float32)
-    chin_line   = float(jaw_pts[:, 1].max())          # actual chin bottom
-    neck_bot    = chin_line + neck_depth
-    grad        = np.clip(1.0 - (ys - chin_line) / max(1.0, neck_bot - chin_line), 0.0, 1.0)
-    neck_mask   = neck_mask * grad[:, None]
-
-    # Smooth edges for invisible blending
-    blur_k = max(15, int(face_h * 0.07) | 1)
-    neck_mask = cv2.GaussianBlur(neck_mask, (blur_k, blur_k), 0)
-    return np.clip(neck_mask, 0.0, 1.0)
+    grad = np.clip(1.0 - (ys - chin_y) / (neck_depth + 1) * 0.5, 0.4, 1.0)
+    neck_mask = neck_mask * grad[:, None]
+    
+    # Same blur as face (31x31 for smooth transition)
+    neck_mask = cv2.GaussianBlur(neck_mask, (31, 31), 0)
+    neck_mask = np.clip(neck_mask, 0.0, 1.0)
 
 
 def fix_light(image):
@@ -303,8 +465,12 @@ def fix_light(image):
     face_mask_lr = np.clip(face_mask_lr, 0.0, 1.0)
     mask_bool_lr = face_mask_lr > 0.5
 
-    # Masque cou précis — polygone construit depuis les landmarks du menton réel
-    neck_mask_lr = _build_neck_mask_smart(face_pts_lr, SHADOW_INPUT_SIZE, SHADOW_INPUT_SIZE)
+    # Masque cou — use EXACT same mask logic as user's code
+    _, face_pts_full = mask_gen.detect(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    if face_pts_full is not None and len(face_pts_full) >= 478:
+        neck_mask_hr = _create_neck_mask_exact(image, face_pts_full)
+    else:
+        neck_mask_hr = np.zeros((orig_h, orig_w), dtype=np.float32)
 
     # 3. Inférence ShadowRemoval
     tensor = (torch.from_numpy(rgb_lr.astype(np.float32) / 255.0)
@@ -323,37 +489,53 @@ def fix_light(image):
     if mean_diff < (std_dev * 0.15):
         return image
 
-    # 5. Force adaptative
-    dynamic_strength = float(np.clip(0.40 + (mean_diff / 100.0), 0.45, 0.60))
+    # 5. Force adaptative - higher for hard shadows (up to 80%)
+    dynamic_strength = float(np.clip(0.50 + (mean_diff / 70.0), 0.55, 0.80))
 
-    # 6. Upscale prédiction + masques
+    # 6. Upscale prédiction + masques (neck_mask_hr already at HR from advanced function)
     pred_bgr_hr  = cv2.resize(pred_bgr_lr,  (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
     face_mask_hr = cv2.resize(face_mask_lr, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
-    neck_mask_hr = cv2.resize(neck_mask_lr, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
 
     # Érosion légère du masque visage
     inner_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     face_mask_hr = cv2.erode(face_mask_hr, inner_kernel)
     face_mask_hr = np.clip(face_mask_hr, 0.0, 1.0)
+    
+    # Same erosion for neck mask
+    neck_mask_hr = cv2.erode(neck_mask_hr, inner_kernel)
+    neck_mask_hr = np.clip(neck_mask_hr, 0.0, 1.0)
 
-    # 7. Texture HF
+    # 7. Keep original texture - only use L-channel (luminance) from model
+    # This removes shadows while preserving ORIGINAL skin texture and color
     image_f   = image.astype(np.float32)
     pred_f    = pred_bgr_hr.astype(np.float32)
     blur_orig = cv2.GaussianBlur(image_f, (0, 0), sigmaX=2.0)
-    texture_hf = np.clip(image_f - blur_orig, -15.0, 15.0)
+    texture_hf = np.clip(image_f - blur_orig, -15.0, 15.0)  # ORIGINAL texture
+    
+    # Get L-channel (luminance) from model prediction for shadow removal
+    orig_lab = cv2.cvtColor(image.astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
+    pred_lab = cv2.cvtColor(pred_f.astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
+    l_diff = pred_lab[:, :, 0] - orig_lab[:, :, 0]  # L difference = shadow removal
+    
+    # Apply L correction ONLY - preserves original texture and color
+    corrected_lab = orig_lab.copy()
+    corrected_lab[:, :, 0] = np.clip(orig_lab[:, :, 0] + l_diff * dynamic_strength, 0, 255)
+    corrected_bgr = cv2.cvtColor(corrected_lab.astype(np.uint8), cv2.COLOR_LAB2BGR).astype(np.float32)
+    
+    # Add back ORIGINAL texture (not model's)
+    corrected_textured = corrected_bgr + texture_hf
 
-    pred_soft     = cv2.GaussianBlur(pred_f, (0, 0), sigmaX=1.5)
-    pred_textured = pred_soft + texture_hf
-
-    # 8. Fusion visage
+    # 8. Face blend - removes shadows, keeps original texture
     alpha_face = (cv2.GaussianBlur(face_mask_hr, (15, 15), 0) * dynamic_strength)[..., None]
-    blended    = image_f * (1.0 - alpha_face) + pred_textured * alpha_face
+    blended    = image_f * (1.0 - alpha_face) + corrected_textured * alpha_face
 
-    # 9. Fusion cou — apply same model prediction as face
-    # Check if neck mask has significant coverage
-    if neck_mask_hr.sum() > 100:
-        alpha_neck = (cv2.GaussianBlur(neck_mask_hr, (15, 15), 0) * dynamic_strength)[..., None]
-        blended    = blended * (1.0 - alpha_neck) + pred_textured * alpha_neck
+    # 9. Neck blend - same L-channel approach (preserves original texture)
+    if neck_mask_hr is not None and neck_mask_hr.sum() > 10:
+        if neck_mask_hr.shape[:2] != (orig_h, orig_w):
+            neck_mask_hr = cv2.resize(neck_mask_hr, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+        
+        alpha_neck = (cv2.GaussianBlur(neck_mask_hr, (21, 21), 0) * dynamic_strength)[..., None]
+        blended = blended * (1.0 - alpha_neck) + corrected_textured * alpha_neck
 
     return np.clip(blended, 0, 255).astype(np.uint8)
 
